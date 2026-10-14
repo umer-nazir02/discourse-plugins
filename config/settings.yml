@@ -1,0 +1,4 @@
+plugins:
+  discourse_meta_tag_enabled:
+    default: true
+    client: false

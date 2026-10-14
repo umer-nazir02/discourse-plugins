@@ -1,0 +1,3 @@
+en:
+  site_settings:
+    discourse_meta_tag_enabled: "Show generic hobbyDB previews to anonymous link-preview bots for existing, non-deleted restricted topics."
