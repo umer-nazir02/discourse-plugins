@@ -8,11 +8,28 @@ require_relative "../lib/discourse_meta_tag/topic_preview"
 
 module SiteSetting
   class << self
-    attr_accessor :discourse_meta_tag_enabled, :login_required
+    attr_accessor :discourse_meta_tag_enabled, :login_required, :redirect_404_enabled, :redirect_404_url
 
     def login_required?
       login_required
     end
+  end
+end
+
+module Permalink
+  class << self
+    attr_accessor :record
+
+    def find_by_url(_url)
+      record
+    end
+  end
+end
+
+# The real redirect plugin only uses ActiveSupport's present? on its URL.
+class PreviewSettingUrl < String
+  def present?
+    !empty?
   end
 end
 
@@ -32,18 +49,20 @@ end
 
 # A minimal controller boundary for running the plugin without Rails.
 # Full routing, authentication and Guardian checks live in the request specs.
-class PreviewController
-  attr_accessor :current_user, :action_name, :request, :response, :params, :visible
+class ApplicationController
+  attr_accessor :current_user, :action_name, :request, :response, :params, :visible, :permalink_visible
 
   def initialize
     @action_name = "show"
     @params = { id: "123" }
     @visible = false
+    @permalink_visible = true
     @request = OpenStruct.new(
       get?: true,
       xhr?: false,
       format: OpenStruct.new(html?: true),
       user_agent: "Discordbot/2.0",
+      fullpath: "/t/restricted-topic/123",
       env: { "ANON_CACHE_DURATION" => 60 },
     )
     @response = OpenStruct.new(status: 200, headers: {}, content_type: "text/html")
@@ -57,14 +76,31 @@ class PreviewController
     visible
   end
 
+  def can_see_permalink_target?(_permalink)
+    permalink_visible
+  end
+
   def response_body=(body)
     response.body = body
   end
 
   def rescue_discourse_actions(type, status_code, opts = nil)
-    response.status = opts && opts[:permalink] ? 301 : status_code
+    permalink = Permalink.find_by_url(request.fullpath) if opts && opts[:check_permalinks]
+    response.status =
+      if type == :not_found && permalink && permalink_visible && permalink.target_url
+        301
+      else
+        status_code
+      end
     response.body = "Original #{type} response"
     :original_result
+  end
+
+  def redirect_to(url, allow_other_host:)
+    raise "Expected an external redirect" unless allow_other_host
+    response.status = 302
+    response.headers["Location"] = url
+    self.response_body = "Original 404 redirect"
   end
 
   def redirect_to_login_if_required
@@ -74,12 +110,30 @@ class PreviewController
   end
 end
 
-PreviewController.prepend(DiscourseMetaTag::TopicPreview)
+class PreviewController < ApplicationController
+  prepend DiscourseMetaTag::TopicPreview
+end
+
+# Load the provided redirect plugin verbatim against the controller boundary.
+# This preserves its real superclass prepend and early-return behavior.
+class Redirect404PluginLoader
+  def enabled_site_setting(_name); end
+
+  def after_initialize(&block)
+    block.call
+  end
+end
+
+redirect_fixture = File.expand_path("fixtures/discourse-redirect-404/plugin.rb", __dir__)
+Redirect404PluginLoader.new.instance_eval(File.read(redirect_fixture), redirect_fixture)
 
 class TopicPreviewTest < Minitest::Test
   def setup
     SiteSetting.discourse_meta_tag_enabled = true
     SiteSetting.login_required = false
+    SiteSetting.redirect_404_enabled = false
+    SiteSetting.redirect_404_url = PreviewSettingUrl.new("https://www.hobbydb.com/404")
+    Permalink.record = nil
     Topic.record = OpenStruct.new(deleted_at: nil)
     @controller = PreviewController.new
   end
@@ -202,9 +256,84 @@ class TopicPreviewTest < Minitest::Test
   end
 
   def test_permalinks_are_preserved
-    @controller.rescue_discourse_actions(:not_found, 404, { permalink: true })
+    Permalink.record = OpenStruct.new(target_url: "/t/public-topic/456")
+    @controller.rescue_discourse_actions(:not_found, 404, { check_permalinks: true })
     assert_equal 301, @controller.response.status
     assert_equal "Original not_found response", @controller.response.body
+  end
+
+  def test_restricted_preview_wins_over_real_404_redirect_plugin
+    SiteSetting.redirect_404_enabled = true
+    @controller.rescue_discourse_actions(:not_found, 404)
+    assert_equal 200, @controller.response.status
+    assert_includes @controller.response.body, 'property="og:title" content="hobbyDB Forum"'
+    refute @controller.response.headers.key?("Location")
+  end
+
+  def test_missing_and_deleted_topics_keep_real_404_redirect
+    SiteSetting.redirect_404_enabled = true
+    Topic.record = nil
+    @controller.rescue_discourse_actions(:not_found, 404)
+    assert_equal 302, @controller.response.status
+    assert_equal "https://www.hobbydb.com/404", @controller.response.headers["Location"]
+    assert_equal "Original 404 redirect", @controller.response.body
+    Topic.record = OpenStruct.new(deleted_at: Time.now)
+    @controller.rescue_discourse_actions(:not_found, 404)
+    assert_equal 302, @controller.response.status
+    assert_equal "Original 404 redirect", @controller.response.body
+  end
+
+  def test_browsers_and_logged_in_requests_keep_real_404_redirect
+    SiteSetting.redirect_404_enabled = true
+    @controller.request.user_agent = "Mozilla/5.0"
+    @controller.rescue_discourse_actions(:not_found, 404)
+    assert_equal 302, @controller.response.status
+    assert_equal "Original 404 redirect", @controller.response.body
+    @controller.request.user_agent = "Discordbot/2.0"
+    @controller.current_user = Object.new
+    @controller.rescue_discourse_actions(:not_found, 404)
+    assert_equal 302, @controller.response.status
+    assert_equal "Original 404 redirect", @controller.response.body
+  end
+
+  def test_json_and_xhr_keep_errors_with_real_404_redirect_plugin
+    SiteSetting.redirect_404_enabled = true
+    @controller.request.format = OpenStruct.new(html?: false)
+    assert_original_error
+    @controller.request.format = OpenStruct.new(html?: true)
+    @controller.request[:xhr?] = true
+    assert_original_error
+  end
+
+  def test_disabled_preview_plugin_keeps_real_404_redirect
+    SiteSetting.redirect_404_enabled = true
+    SiteSetting.discourse_meta_tag_enabled = false
+    @controller.rescue_discourse_actions(:not_found, 404)
+    assert_equal 302, @controller.response.status
+    assert_equal "Original 404 redirect", @controller.response.body
+  end
+
+  def test_public_topic_error_keeps_real_404_redirect
+    SiteSetting.redirect_404_enabled = true
+    @controller.visible = true
+    @controller.rescue_discourse_actions(:not_found, 404)
+    assert_equal 302, @controller.response.status
+    assert_equal "Original 404 redirect", @controller.response.body
+  end
+
+  def test_visible_permalink_keeps_existing_redirect_plugin_behavior
+    SiteSetting.redirect_404_enabled = true
+    Permalink.record = OpenStruct.new(target_url: "/t/public-topic/456")
+    @controller.rescue_discourse_actions(:not_found, 404, { check_permalinks: true })
+    assert_equal 302, @controller.response.status
+    assert_equal "Original 404 redirect", @controller.response.body
+  end
+
+  def test_inaccessible_permalink_target_does_not_suppress_restricted_preview
+    Permalink.record = OpenStruct.new(target_url: "/t/other-restricted-topic/456")
+    @controller.permalink_visible = false
+    @controller.rescue_discourse_actions(:not_found, 404, { check_permalinks: true })
+    assert_equal 200, @controller.response.status
   end
 
   def test_login_required_topic_request_receives_fallback

@@ -25,14 +25,13 @@ module DiscourseMetaTag
     HTML
 
     def rescue_discourse_actions(type, status_code, opts = nil)
-      use_preview =
-        ACCESS_ERRORS.include?(type) && ACCESS_STATUSES.include?(status_code) &&
-          hobbydb_preview_request?
+      return super unless ACCESS_ERRORS.include?(type) && ACCESS_STATUSES.include?(status_code) &&
+        hobbydb_preview_request? && hobbydb_restricted_topic?
 
-      # Let Discourse resolve permalinks and apply its normal error handling first.
-      result = super
-      return result unless use_preview && ACCESS_STATUSES.include?(response.status) &&
-        hobbydb_restricted_topic?
+      # Keep visible permalink targets on the existing redirect path. Otherwise
+      # handle the restricted preview before an ApplicationController error
+      # plugin can turn the 404 into an external redirect.
+      return super if hobbydb_visible_permalink?(type, opts)
 
       hobbydb_topic_preview
     end
@@ -71,6 +70,13 @@ module DiscourseMetaTag
       topic && topic.deleted_at.nil? && (SiteSetting.login_required? || !guardian.can_see?(topic))
     end
 
+    def hobbydb_visible_permalink?(type, opts)
+      return false unless type == :not_found && opts && opts[:check_permalinks]
+
+      permalink = Permalink.find_by_url(opts[:original_path] || request.fullpath)
+      permalink && guardian.can_see_permalink_target?(permalink) && permalink.target_url
+    end
+
     def hobbydb_topic_preview
       # AnonymousCache uses this env value independently of Cache-Control.
       request.env.delete("ANON_CACHE_DURATION")
@@ -78,8 +84,7 @@ module DiscourseMetaTag
       response.headers["X-Robots-Tag"] = "noindex, nofollow"
       response.content_type = "text/html; charset=utf-8"
       response.status = 200
-      # Assigning the completed response avoids a second Rails render after the
-      # original error renderer has run, and halts the login before_action.
+      # Assigning the completed response also halts the login before_action.
       self.response_body = HTML
     end
   end

@@ -19,6 +19,7 @@ RSpec.describe "hobbyDB inaccessible topic previews", type: :request do
   before do
     SiteSetting.discourse_meta_tag_enabled = true
     SiteSetting.login_required = false
+    SiteSetting.redirect_404_enabled = false if SiteSetting.respond_to?(:redirect_404_enabled)
   end
 
   def head_metadata
@@ -201,5 +202,66 @@ RSpec.describe "hobbyDB inaccessible topic previews", type: :request do
     get "/categories/not-a-category/999999999", headers: bot_headers
     expect(response.status).to eq(404)
     expect(response.body).not_to include('content="hobbyDB Forum"')
+  end
+
+  context "with discourse-redirect-404 enabled" do
+    before do
+      skip "Install discourse-redirect-404 to run compatibility request specs" unless
+        defined?(DiscourseRedirect404::ApplicationControllerPatch) &&
+          SiteSetting.respond_to?(:redirect_404_enabled)
+
+      SiteSetting.redirect_404_enabled = true
+      SiteSetting.redirect_404_url = "https://www.hobbydb.com/404"
+      SiteSetting.detailed_404 = false
+    end
+
+    it "previews a restricted topic before the 404 redirect handler" do
+      get restricted_topic.relative_url, headers: bot_headers
+      expect_generic_preview
+      expect(response.headers["Location"]).to be_nil
+    end
+
+    it "keeps the 404 redirect for missing and deleted topics" do
+      get "/t/nonexistent/999999999", headers: bot_headers
+      expect(response.status).to eq(302)
+      expect(response.headers["Location"]).to eq("https://www.hobbydb.com/404")
+
+      public_post.topic.trash!
+      get public_post.topic.relative_url, headers: bot_headers
+      expect(response.status).to eq(302)
+      expect(response.headers["Location"]).to eq("https://www.hobbydb.com/404")
+      expect(response.body).not_to include('content="hobbyDB Forum"')
+    end
+
+    it "keeps the 404 redirect for browsers and logged-in users" do
+      get restricted_topic.relative_url,
+          headers: bot_headers.merge("HTTP_USER_AGENT" => "Mozilla/5.0")
+      expect(response.status).to eq(302)
+      expect(response.headers["Location"]).to eq("https://www.hobbydb.com/404")
+
+      sign_in(user)
+      get restricted_topic.relative_url, headers: bot_headers
+      expect(response.status).to eq(302)
+      expect(response.headers["Location"]).to eq("https://www.hobbydb.com/404")
+    end
+
+    it "preserves public topic rendering with both plugins enabled" do
+      get public_post.topic.relative_url, headers: bot_headers
+      expect(response.status).to eq(200)
+      expect(response.body).to include(public_post.topic.title)
+      expect(response.body).not_to include('content="https://forum.hobbydb.com"')
+    end
+
+    it "preserves JSON and XHR access errors with both plugins enabled" do
+      get "#{restricted_topic.relative_url}.json",
+          headers: bot_headers.merge("HTTP_ACCEPT" => "application/json")
+      expect([403, 404]).to include(response.status)
+      expect(response.media_type).to eq("application/json")
+
+      get restricted_topic.relative_url,
+          headers: bot_headers.merge("HTTP_X_REQUESTED_WITH" => "XMLHttpRequest")
+      expect([403, 404]).to include(response.status)
+      expect(response.body).not_to include('content="hobbyDB Forum"')
+    end
   end
 end

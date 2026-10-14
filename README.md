@@ -17,6 +17,12 @@ The fallback contains only the forum URL, name, description and image. It never 
 
 User-agent matching selects a generic response; it grants no access to topic data. Bots blocked by Discourse's crawler blocklist, a reverse proxy or a firewall never reach this plugin.
 
+## Compatibility with discourse-redirect-404
+
+Restricted-topic previews are handled before the application-level 404 redirect handler. With both plugins enabled, an anonymous preview bot receives the generic metadata for an existing restricted topic; missing/deleted topics and ordinary browser or logged-in requests retain the redirect plugin's behavior. Visible permalink targets retain the existing redirect handling.
+
+No changes to `discourse-redirect-404` are needed. The standalone suite loads an exact copy of the supplied redirect plugin as a fixture to verify the interaction. The compatibility request specs run when that plugin is also installed in the Discourse test checkout; otherwise that group is skipped.
+
 ## Installation
 
 Install this folder as `plugins/discourse-meta-tag` in the Discourse server checkout/container and restart Discourse. The source is on the `preview-meta-tags` branch of `https://github.com/umer-nazir02/discourse-plugins`.
@@ -47,7 +53,7 @@ Request specs, from the root of a Discourse development/test checkout with this 
 LOAD_PLUGINS=1 bundle exec rspec plugins/discourse-meta-tag/spec/requests/topic_preview_spec.rb
 ```
 
-The request specs exercise real routes, authentication, Guardian permissions, restricted categories, private messages, missing/deleted topics, login requirements and public-topic regressions. Standalone tests cannot verify those Discourse integrations.
+The request specs exercise real routes, authentication, Guardian permissions, restricted categories, private messages, missing/deleted topics, login requirements, public-topic regressions and compatibility with `discourse-redirect-404` when installed. Standalone tests cannot verify those Discourse integrations.
 
 After installation, test an inaccessible topic with a preview user agent:
 
